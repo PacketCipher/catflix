@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 CatFlix server – production VPS backend handling HTTP, TCP, UDP, WebSocket,
-with persistent sessions, session timeout cleanup, and EXTREME debug logging
-for TCP session lifecycle.
+with persistent sessions, session timeout cleanup, stale resource cleaners,
+and full debug logging.
 """
 
 import base64, json, logging, os, random, secrets, select, socket, struct, sys, threading, time, traceback, uuid
@@ -111,7 +111,7 @@ def handle_tcp_connect(req: dict) -> dict:
     port = int(req["port"])
     log.info("[TCP-CONNECT] Attempting connection to %s:%d (session %s)", host, port, session_id)
     try:
-        sock = socket.create_connection((host, port), timeout=10)
+        sock = socket.create_connection((host, port), timeout=20)
         sock.settimeout(0.5)          # short timeout to loop without busy‑waiting
         log.debug("[TCP-CONNECT] Socket created, fd=%d", sock.fileno())
 
@@ -187,7 +187,7 @@ def handle_tcp_poll(req: dict) -> dict:
     req["data"] = ""
     return handle_tcp_data(req)
 
-# ---- UDP handlers (unchanged) ----
+# ---- UDP handlers (FIXED) ----
 def handle_udp_associate(req: dict) -> dict:
     session_id = req["session_id"]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -199,10 +199,13 @@ def handle_udp_associate(req: dict) -> dict:
 
 def handle_udp_data(req: dict) -> dict:
     session_id = req["session_id"]
-    sock = udp_sessions.get(session_id, {}).get('socket')
+    session = udp_sessions.get(session_id)      # FIXED – fetch the dict
+    if not session:
+        return {"error": "session not found"}
+    sock = session.get('socket')
     if not sock:
         return {"error": "session not found"}
-    session['last_access'] = time.time()
+    session['last_access'] = time.time()        # FIXED – use 'session' correctly
     data = base64.b64decode(req["data"])
     host = req["host"]
     port = int(req["port"])
@@ -223,10 +226,13 @@ def handle_udp_data(req: dict) -> dict:
 
 def handle_udp_poll(req: dict) -> dict:
     session_id = req["session_id"]
-    sock = udp_sessions.get(session_id, {}).get('socket')
+    session = udp_sessions.get(session_id)      # FIXED
+    if not session:
+        return {"error": "session not found"}
+    sock = session.get('socket')
     if not sock:
         return {"error": "session not found"}
-    session['last_access'] = time.time()
+    session['last_access'] = time.time()        # FIXED
     datagrams = []
     while True:
         ready, _, _ = select.select([sock], [], [], 0)
@@ -260,7 +266,7 @@ def handle_ws_connect(req: dict) -> dict:
         for k, v in headers.items():
             if k.lower() in ("cookie", "user-agent", "origin", "sec-websocket-protocol"):
                 extra_headers[k] = v
-        ws = create_connection(ws_url, header=extra_headers, timeout=10)
+        ws = create_connection(ws_url, header=extra_headers, timeout=20)
         response_headers = dict(ws.headers) if hasattr(ws, 'headers') else {}
         response_headers.setdefault("Upgrade", "websocket")
         response_headers.setdefault("Connection", "Upgrade")
@@ -344,6 +350,25 @@ def cleanup_stale_sessions():
                 del ws_sessions[sid]
                 log.info("Cleaned up stale WebSocket session %s", sid)
 
+# ---- Cleanup for stale stream buffers and overflow chunks ----
+def cleanup_stale_streams():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        for sid, buf in list(stream_buffers.items()):
+            if now - buf.get('timestamp', 0) > 300:
+                del stream_buffers[sid]
+                log.info("Cleaned up stale stream buffer %s", sid)
+
+def cleanup_stale_overflows():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        for bid, buf in list(overflow_chunks.items()):
+            if now - buf.get('timestamp', 0) > 300:
+                del overflow_chunks[bid]
+                log.info("Cleaned up stale overflow batch %s", bid)
+
 # ---- Single request proxy (unchanged) ----
 def proxy_single(req: dict) -> dict:
     return proxy_single_with_session(req, None)
@@ -361,7 +386,7 @@ def proxy_single_with_session(req: dict, session: requests.Session | None) -> di
     t0 = time.time()
     req_fn = session.request if session else requests.request
     try:
-        resp = req_fn(method, url, headers=out_headers, data=body, timeout=15, allow_redirects=False)
+        resp = req_fn(method, url, headers=out_headers, data=body, timeout=20, allow_redirects=False)
         dt = time.time() - t0
         log.debug("%s %s → %d (%.2fs)", method, url[:80], resp.status_code, dt)
         return {"status": resp.status_code, "headers": dict(resp.headers), "body": base64.b64encode(resp.content).decode()}
@@ -380,7 +405,7 @@ def handle_large_download(req: dict, session: requests.Session | None) -> dict:
                    if k.lower() not in ("host", "connection", "proxy-connection", "proxy-authorization", "transfer-encoding")}
     req_fn = session.request if session else requests.request
     try:
-        head_resp = req_fn("HEAD", url, headers=out_headers, timeout=15)
+        head_resp = req_fn("HEAD", url, headers=out_headers, timeout=20)
         content_length = int(head_resp.headers.get("Content-Length", 0))
         accept_ranges = head_resp.headers.get("Accept-Ranges", "").lower()
         if content_length == 0 or accept_ranges != "bytes":
@@ -399,7 +424,7 @@ def handle_large_download(req: dict, session: requests.Session | None) -> dict:
     range_end = min(chunk_size, total_size) - 1
     range_headers = {**out_headers, "Range": f"bytes={range_start}-{range_end}"}
     try:
-        resp = req_fn("GET", url, headers=range_headers, timeout=15)
+        resp = req_fn("GET", url, headers=range_headers, timeout=20)
         if resp.status_code not in (200, 206):
             log.warning("Range request failed, fallback to single fetch")
             return proxy_single_with_session(req, session)
@@ -412,6 +437,7 @@ def handle_large_download(req: dict, session: requests.Session | None) -> dict:
             "total_size": total_size,
             "chunk_size": chunk_size,
             "next_offset": range_end + 1,
+            "timestamp": time.time()            # ← for cleanup
         }
         return {
             "_stream": {
@@ -440,7 +466,7 @@ def fetch_stream_chunk(stream_id: str, chunk_index: int) -> bytes:
     range_end = min(offset + chunk_size, total_size) - 1
     range_headers = {**headers, "Range": f"bytes={range_start}-{range_end}"}
     cookies = buf["session_cookies"]
-    resp = requests.get(url, headers=range_headers, cookies=cookies, timeout=15)
+    resp = requests.get(url, headers=range_headers, cookies=cookies, timeout=20)
     if resp.status_code not in (200, 206):
         raise RuntimeError(f"Chunk fetch failed: {resp.status_code}")
     return base64.b64encode(resp.content).decode()
@@ -474,7 +500,7 @@ def process_batch_with_cookies(reqs: list[dict]) -> list[dict]:
     for t in threads: t.join()
     return [r for r in results if r is not None]
 
-# ---- Multi‑split batch overflow (unchanged) ----
+# ---- Multi‑split batch overflow (with timestamp for cleanup) ----
 overflow_chunks: dict[str, dict] = {}
 
 def split_results_recursive(results: list, max_encrypted: int) -> tuple[list, str | None, str]:
@@ -487,7 +513,11 @@ def split_results_recursive(results: list, max_encrypted: int) -> tuple[list, st
         return recursive_split(items[:mid]) + recursive_split(items[mid:])
     chunks = recursive_split(results)
     chunk_tokens = [f"batch_{batch_id}_{idx}" for idx in range(len(chunks))]
-    overflow_chunks[batch_id] = {"chunks": chunks, "tokens": chunk_tokens}
+    overflow_chunks[batch_id] = {
+        "chunks": chunks,
+        "tokens": chunk_tokens,
+        "timestamp": time.time()          # ← for cleanup
+    }
     if not chunk_tokens: return [], None, batch_id
     first_chunk = chunks[0]
     next_token = chunk_tokens[1] if len(chunk_tokens) > 1 else None
@@ -550,7 +580,6 @@ def api():
         q = request.args.get("q", "")
     if not q:
         return Response("missing q", status=400)
-    log.debug("API call with q length=%d", len(q))
 
     try:
         encrypted = base64.urlsafe_b64decode(q)
@@ -636,4 +665,6 @@ def api():
 if __name__ == "__main__":
     threading.Thread(target=cleanup_stale_uploads, daemon=True).start()
     threading.Thread(target=cleanup_stale_sessions, daemon=True).start()
+    threading.Thread(target=cleanup_stale_streams, daemon=True).start()
+    threading.Thread(target=cleanup_stale_overflows, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
