@@ -32,7 +32,7 @@ MAX_ENCRYPTED_SIZE = 40 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT", 120))
 
-executor = ThreadPoolExecutor(max_workers=20)
+executor = ThreadPoolExecutor(max_workers=100)
 
 # ---- AES & padding ----
 def aes_gcm_encrypt(plaintext: bytes) -> bytes:
