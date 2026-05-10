@@ -1,0 +1,1 @@
+docker run -it --rm   -p 80:80   -v "$(pwd)/certbot/www:/var/www/certbot"   -v "$(pwd)/certbot/conf:/etc/letsencrypt"   certbot/certbot certonly --standalone   --email your-email@example.com   --agree-tos   --no-eff-email   -d thisisfoxy.shop
