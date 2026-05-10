@@ -44,8 +44,8 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", 8080))
 SOCKS_PORT = int(os.environ.get("SOCKS_PORT", 1080))
 
 # ---------- TUNING – lower these to send batches almost instantly ----------
-MIN_BATCH_INTERVAL = float(os.environ.get("MIN_BATCH_INTERVAL", 0.01))   # 10 ms
-MAX_BATCH_INTERVAL = float(os.environ.get("MAX_BATCH_INTERVAL", 0.1))    # 100 ms
+MIN_BATCH_INTERVAL = float(os.environ.get("MIN_BATCH_INTERVAL", 0.1))   # 10 ms
+MAX_BATCH_INTERVAL = float(os.environ.get("MAX_BATCH_INTERVAL", 0.3))    # 100 ms
 MIN_BATCH_SIZE = int(os.environ.get("MIN_BATCH_SIZE", 0))                # 0 = send even when empty
 MAX_HOLD_TIME = float(os.environ.get("MAX_HOLD_TIME", 0.1))              # force send after 0.1 s
 # ---------------------------------------------------------------------------
@@ -629,7 +629,7 @@ class BatchManager:
     def _pick_front_domain(self) -> str:
         return random.choice(FRONT_DOMAINS)
 
-    async def _relay_batch(self, reqs: list[dict], max_retries=10) -> bytes:
+    async def _relay_batch(self, reqs: list[dict], max_retries=30) -> bytes:
         """Relay a batch with automatic retry, front domain rotation, and optional padding."""
         sni_host = self._pick_front_domain()
         for attempt in range(max_retries):
@@ -667,7 +667,7 @@ class BatchManager:
                 log.warning("Relay attempt %d/%d failed: %s", attempt+1, max_retries, e)
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
 
     def _build_http_response(self, resp: dict) -> bytes:
         status = resp["status"]
