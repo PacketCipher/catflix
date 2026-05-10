@@ -44,8 +44,8 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", 8080))
 SOCKS_PORT = int(os.environ.get("SOCKS_PORT", 1080))
 
 # ---------- TUNING – lower these to send batches almost instantly ----------
-MIN_BATCH_INTERVAL = float(os.environ.get("MIN_BATCH_INTERVAL", 0.1))   # 10 ms
-MAX_BATCH_INTERVAL = float(os.environ.get("MAX_BATCH_INTERVAL", 0.3))    # 100 ms
+MIN_BATCH_INTERVAL = float(os.environ.get("MIN_BATCH_INTERVAL", 0.1))   # 100 ms
+MAX_BATCH_INTERVAL = float(os.environ.get("MAX_BATCH_INTERVAL", 0.3))    # 300 ms
 MIN_BATCH_SIZE = int(os.environ.get("MIN_BATCH_SIZE", 0))                # 0 = send even when empty
 MAX_HOLD_TIME = float(os.environ.get("MAX_HOLD_TIME", 0.1))              # force send after 0.1 s
 # ---------------------------------------------------------------------------
