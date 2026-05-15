@@ -51,7 +51,6 @@ MAX_HOLD_TIME = float(os.environ.get("MAX_HOLD_TIME", 0.1))              # force
 # ---------------------------------------------------------------------------
 
 UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024
-LARGE_DOWNLOAD_THRESHOLD = 40 * 1024 * 1024
 
 # Optional payload padding (the server must also strip this padding)
 PADDING_ENABLE = os.environ.get("PADDING_ENABLE", "false").lower() == "true"
@@ -994,10 +993,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             future = asyncio.get_event_loop().create_future()
             await handle_large_upload(method, url, headers, body, future, conn_id)
             response = await future
-        elif _should_activate_large_download(method, headers, url):
-            log.info("Activating large‑download streaming for %s", url)
-            req_obj["_catflix_large_download"] = True
-            response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
         else:
             response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
 
@@ -1209,10 +1204,6 @@ async def _relay_http_stream(reader, writer, host: str, conn_id: str):
                 future = asyncio.get_event_loop().create_future()
                 await handle_large_upload(method, url, headers, body, future, conn_id)
                 response = await future
-            elif _should_activate_large_download(method, headers, url):
-                log.info("MITM large download: %s", url)
-                req_obj["_catflix_large_download"] = True
-                response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
             else:
                 response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
 
@@ -1285,30 +1276,6 @@ async def handle_large_upload(method, url, headers, body, future, conn_id: str):
         # Use per‑connection dedup for each chunk as well
         asyncio.create_task(batch_mgr.add_request(req, conn_id=conn_id))
     return await future
-
-def _is_large_download(url: str) -> bool:
-    ext = url.lower().split("?")[0].split("/")[-1].split(".")[-1] if "." in url else ""
-    return ext in {
-        "zip","tar","gz","bz2","xz","7z","rar","exe","msi","dmg","iso","img",
-        "mp4","mkv","avi","mov","webm","mp3","flac","wav","aac",
-        "pdf","doc","docx","ppt","pptx","wasm"
-    }
-
-def _should_activate_large_download(method: str, headers: dict, url: str) -> bool:
-    if method.upper() != "GET": return False
-    range_val = None
-    for k, v in headers.items():
-        if k.lower() == "range":
-            range_val = v
-            break
-    if range_val:
-        m = re.match(r'bytes\s*=\s*(\d+)\s*-\s*(\d+)', range_val, re.IGNORECASE)
-        if m:
-            start, end = int(m.group(1)), int(m.group(2))
-            if end >= start and (end - start + 1) > LARGE_DOWNLOAD_THRESHOLD:
-                return True
-        return False
-    return _is_large_download(url)
 
 # ============================================================
 # Main
