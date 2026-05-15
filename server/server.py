@@ -374,8 +374,6 @@ def proxy_single(req: dict) -> dict:
     return proxy_single_with_session(req, None)
 
 def proxy_single_with_session(req: dict, session: requests.Session | None) -> dict:
-    if req.get("_catflix_large_download") and req.get("method", "GET").upper() == "GET":
-        return handle_large_download(req, session)
     method = req.get("method", "GET")
     url = req.get("url", "")
     headers = req.get("headers", {})
@@ -397,62 +395,6 @@ def proxy_single_with_session(req: dict, session: requests.Session | None) -> di
 
 # ---- Large download (unchanged) ----
 stream_buffers: dict[str, dict] = {}
-
-def handle_large_download(req: dict, session: requests.Session | None) -> dict:
-    url = req["url"]
-    headers = req.get("headers", {})
-    out_headers = {k: v for k, v in headers.items()
-                   if k.lower() not in ("host", "connection", "proxy-connection", "proxy-authorization", "transfer-encoding")}
-    req_fn = session.request if session else requests.request
-    try:
-        head_resp = req_fn("HEAD", url, headers=out_headers, timeout=20)
-        content_length = int(head_resp.headers.get("Content-Length", 0))
-        accept_ranges = head_resp.headers.get("Accept-Ranges", "").lower()
-        if content_length == 0 or accept_ranges != "bytes":
-            log.warning("Large download: no range support, falling back to single fetch")
-            return proxy_single_with_session(req, session)
-    except Exception as e:
-        log.warning("HEAD failed for %s: %s, fallback to single fetch", url, e)
-        return proxy_single_with_session(req, session)
-
-    total_size = content_length
-    chunk_size = DOWNLOAD_CHUNK_SIZE
-    total_chunks = (total_size + chunk_size - 1) // chunk_size
-    log.info("Large download: %s, size=%d, chunks=%d", url, total_size, total_chunks)
-
-    range_start = 0
-    range_end = min(chunk_size, total_size) - 1
-    range_headers = {**out_headers, "Range": f"bytes={range_start}-{range_end}"}
-    try:
-        resp = req_fn("GET", url, headers=range_headers, timeout=20)
-        if resp.status_code not in (200, 206):
-            log.warning("Range request failed, fallback to single fetch")
-            return proxy_single_with_session(req, session)
-        first_chunk = resp.content
-        stream_id = str(uuid.uuid4())
-        stream_buffers[stream_id] = {
-            "url": url,
-            "headers": out_headers,
-            "session_cookies": session.cookies.get_dict() if session else {},
-            "total_size": total_size,
-            "chunk_size": chunk_size,
-            "next_offset": range_end + 1,
-            "timestamp": time.time()            # ← for cleanup
-        }
-        return {
-            "_stream": {
-                "stream_id": stream_id,
-                "chunk_index": 0,
-                "total_chunks": total_chunks,
-                "headers": dict(resp.headers),
-                "body_b64": base64.b64encode(first_chunk).decode(),
-                "more": total_chunks > 1,
-                "continuation_token": f"stream_{stream_id}_1" if total_chunks > 1 else None
-            }
-        }
-    except Exception as e:
-        log.error("Large download initial chunk error: %s", e)
-        return proxy_single_with_session(req, session)
 
 def fetch_stream_chunk(stream_id: str, chunk_index: int) -> bytes:
     buf = stream_buffers.get(stream_id)
