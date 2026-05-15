@@ -400,7 +400,7 @@ async def session_poll_task(session_id: str, req_type: str, poll_body: dict):
 stream_buffers: dict[str, dict] = {}
 
 # ============================================================
-# Batch Manager (unified queue)
+# Batch Manager (unified queue) – with per‑connection deduplication
 # ============================================================
 class BatchManager:
     def __init__(self):
@@ -409,29 +409,80 @@ class BatchManager:
         self.timer_handle = None
         self.oldest_arrival: float = 0.0
 
-    async def _enqueue_request(self, req_obj: dict) -> asyncio.Future:
-        future = asyncio.get_event_loop().create_future()
+        # Per‑connection deduplication (conn_id -> fingerprint -> list of futures)
+        self._dedup_lock = asyncio.Lock()
+        self._pending_requests: dict[str, dict[str, list[asyncio.Future]]] = {}
+
+    async def _enqueue_request(self, req_obj: dict, future: asyncio.Future):
         async with self.lock:
             self.queue.append((req_obj, future))
             now = time.time()
             if len(self.queue) == 1:
                 self.oldest_arrival = now
-            log.debug("Queued request (queue size=%d)", len(self.queue))
             if self.timer_handle is None:
                 interval = random.uniform(MIN_BATCH_INTERVAL, MAX_BATCH_INTERVAL)
                 log.debug("Starting batch timer: %.2fs", interval)
                 self.timer_handle = asyncio.create_task(self._fire_after_delay(interval))
-        return future
 
-    async def add_request(self, req_obj: dict) -> bytes:
-        future = await self._enqueue_request(req_obj)
-        return await future
+    # ------------------------------------------------------------------
+    # Public API: add_request with connection‑scoped dedup
+    # ------------------------------------------------------------------
+    async def add_request(self, req_obj: dict, conn_id: str = "global") -> bytes:
+        """
+        Normal HTTP request with duplicate suppression **per connection**.
+        Provide a unique `conn_id` for each client TCP connection (browser tab).
+        """
+        fingerprint = json.dumps(req_obj, sort_keys=True)
+        async with self._dedup_lock:
+            conn_map = self._pending_requests.setdefault(conn_id, {})
+            if fingerprint in conn_map:
+                # Duplicate inside the same connection – wait for the in‑flight request
+                new_future = asyncio.get_event_loop().create_future()
+                conn_map[fingerprint].append(new_future)
+                log.debug("Duplicate request suppressed (conn=%s): %s", conn_id, fingerprint[:120])
+                return await new_future
+            else:
+                # First occurrence – create the canonical future
+                original_future = asyncio.get_event_loop().create_future()
+                conn_map[fingerprint] = [original_future]
 
+        # Enqueue the single real request
+        await self._enqueue_request(req_obj, original_future)
+
+        try:
+            result = await original_future
+            # Propagate the result to all duplicates in the same connection
+            async with self._dedup_lock:
+                for fut in self._pending_requests.get(conn_id, {}).get(fingerprint, []):
+                    if not fut.done():
+                        fut.set_result(result)
+        except Exception as e:
+            async with self._dedup_lock:
+                for fut in self._pending_requests.get(conn_id, {}).get(fingerprint, []):
+                    if not fut.done():
+                        fut.set_exception(e)
+            raise
+        finally:
+            async with self._dedup_lock:
+                if conn_id in self._pending_requests:
+                    self._pending_requests[conn_id].pop(fingerprint, None)
+                    if not self._pending_requests[conn_id]:
+                        del self._pending_requests[conn_id]
+        return result
+
+    # ------------------------------------------------------------------
+    # Raw requests (session control etc.) – no dedup
+    # ------------------------------------------------------------------
     async def add_raw_request(self, req_obj: dict, route_data: bool = True) -> dict:
+        """Control / session‑related request (no dedup)."""
         req_obj["_route_data"] = route_data
-        future = await self._enqueue_request(req_obj)
+        future = asyncio.get_event_loop().create_future()
+        await self._enqueue_request(req_obj, future)
         return await future
 
+    # ------------------------------------------------------------------
+    # Batch firing logic (unchanged)
+    # ------------------------------------------------------------------
     async def _fire_after_delay(self, interval: float):
         await asyncio.sleep(interval)
         async with self.lock:
@@ -631,9 +682,9 @@ class BatchManager:
 
     async def _relay_batch(self, reqs: list[dict], max_retries=30) -> bytes:
         """Relay a batch with automatic retry, front domain rotation, and optional padding."""
-        sni_host = self._pick_front_domain()
         for attempt in range(max_retries):
             try:
+                sni_host = self._pick_front_domain()
                 payload_reqs = reqs
                 plain_payload = json.dumps(payload_reqs).encode()
                 # Optional padding
@@ -831,6 +882,8 @@ async def handle_socks_client(reader: asyncio.StreamReader, writer: asyncio.Stre
 # HTTP(S) proxy handler (MITM) with full WebSocket support
 # ============================================================
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    # Each browser connection gets its own deduplication scope
+    conn_id = str(uuid.uuid4())
     try:
         first_line = await asyncio.wait_for(reader.readline(), timeout=20)
         if not first_line: return
@@ -842,7 +895,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if method == "CONNECT":
             host, port_str = url.rsplit(":", 1)
             port = int(port_str)
-            await handle_connect(host, port, reader, writer)
+            await handle_connect(host, port, reader, writer, conn_id)
             return
 
         if not url.startswith("http://") and not url.startswith("https://"):
@@ -935,17 +988,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             "body": base64.b64encode(body).decode() if body else None
         }
 
+        # Use per‑connection dedup for all normal requests
         if body and len(body) > UPLOAD_CHUNK_SIZE:
             log.info("Large upload chunking (%d bytes)", len(body))
             future = asyncio.get_event_loop().create_future()
-            await handle_large_upload(method, url, headers, body, future)
+            await handle_large_upload(method, url, headers, body, future, conn_id)
             response = await future
         elif _should_activate_large_download(method, headers, url):
             log.info("Activating large‑download streaming for %s", url)
             req_obj["_catflix_large_download"] = True
-            response = await batch_mgr.add_request(req_obj)
+            response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
         else:
-            response = await batch_mgr.add_request(req_obj)
+            response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
 
         writer.write(response)
         await writer.drain()
@@ -960,10 +1014,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except Exception:
             pass
 
-async def handle_connect(host: str, port: int, reader, writer):
+async def handle_connect(host: str, port: int, reader, writer, conn_id: str):
     log.info("CONNECT → %s:%d", host, port)
 
-    # For TLS ports, perform MITM interception.
+    # For TLS ports, perform MITM interception (passing conn_id through)
     if port == 443:
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
@@ -983,7 +1037,7 @@ async def handle_connect(host: str, port: int, reader, writer):
         new_writer = asyncio.StreamWriter(new_transport, protocol, new_reader, loop)
         log.debug("TLS upgrade successful for %s", host)
         try:
-            await _relay_http_stream(new_reader, new_writer, host)
+            await _relay_http_stream(new_reader, new_writer, host, conn_id)
         finally:
             try:
                 new_writer.close()
@@ -991,7 +1045,7 @@ async def handle_connect(host: str, port: int, reader, writer):
                 pass
         return
 
-    # For non‑TLS ports, treat as a raw TCP tunnel (plain WebSocket, plain HTTP, etc.)
+    # For non‑TLS ports, treat as a raw TCP tunnel
     session_id = str(uuid.uuid4())
     log.info("Raw TCP tunnel → %s:%d (sid=%s)", host, port, session_id)
 
@@ -1042,7 +1096,7 @@ async def handle_connect(host: str, port: int, reader, writer):
         poll_task.cancel()
         unregister_session(session_id)
 
-async def _relay_http_stream(reader, writer, host: str):
+async def _relay_http_stream(reader, writer, host: str, conn_id: str):
     while True:
         try:
             header_data = b""
@@ -1153,14 +1207,14 @@ async def _relay_http_stream(reader, writer, host: str):
             if body and len(body) > UPLOAD_CHUNK_SIZE:
                 log.info("MITM large upload: %d bytes", len(body))
                 future = asyncio.get_event_loop().create_future()
-                await handle_large_upload(method, url, headers, body, future)
+                await handle_large_upload(method, url, headers, body, future, conn_id)
                 response = await future
             elif _should_activate_large_download(method, headers, url):
                 log.info("MITM large download: %s", url)
                 req_obj["_catflix_large_download"] = True
-                response = await batch_mgr.add_request(req_obj)
+                response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
             else:
-                response = await batch_mgr.add_request(req_obj)
+                response = await batch_mgr.add_request(req_obj, conn_id=conn_id)
 
             writer.write(response)
             await writer.drain()
@@ -1208,11 +1262,11 @@ async def _forward_raw_websocket(session_id: str, reader: asyncio.StreamReader, 
         unregister_session(session_id)
 
 # ============================================================
-# Large upload / download helpers
+# Large upload / download helpers (with conn_id)
 # ============================================================
 UPLOAD_BUFFER: dict[str, dict] = {}
 
-async def handle_large_upload(method, url, headers, body, future):
+async def handle_large_upload(method, url, headers, body, future, conn_id: str):
     upload_id = str(uuid.uuid4())
     total_chunks = (len(body) + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
     UPLOAD_BUFFER[upload_id] = {"chunks": [None]*total_chunks, "total": total_chunks, "future": future}
@@ -1228,7 +1282,8 @@ async def handle_large_upload(method, url, headers, body, future):
             "_catflix_chunk": i,
             "_catflix_total": total_chunks
         }
-        asyncio.create_task(batch_mgr.add_request(req))
+        # Use per‑connection dedup for each chunk as well
+        asyncio.create_task(batch_mgr.add_request(req, conn_id=conn_id))
     return await future
 
 def _is_large_download(url: str) -> bool:
