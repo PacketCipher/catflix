@@ -3,6 +3,14 @@
 CatFlix server – production VPS backend handling HTTP, TCP, UDP, WebSocket,
 with persistent sessions, session timeout cleanup, stale resource cleaners,
 and full debug logging.
+
+Unified blob‑splitting design:
+  - The server assembles all results into one JSON response, encrypts, pads.
+  - If the final padded encrypted payload exceeds MAX_ENCRYPTED_SIZE, it is
+    split into raw base64‑encoded chunks delivered via continuation tokens.
+  - The client reassembles the entire blob, decrypts, and processes the
+    complete batch at once.
+  - No separate item‑splitting or list‑splitting mechanisms are required.
 """
 
 import base64, json, logging, os, random, secrets, select, socket, struct, sys, threading, time, traceback, uuid
@@ -28,8 +36,10 @@ log.info("AES key loaded, first 8 bytes: %s", AES_KEY[:8].hex())
 
 MIN_RESPONSE_SIZE = 50 * 1024
 MAX_RESPONSE_SIZE = 100 * 1024
-MAX_ENCRYPTED_SIZE = 40 * 1024 * 1024
-DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
+# MAX_ENCRYPTED_SIZE = 40 * 1024 * 1024       # maximum padded encrypted payload before chunking
+# BLOB_CHUNK_SIZE = 32 * 1024 * 1024          # raw bytes per chunk (before base64)
+MAX_ENCRYPTED_SIZE = 12 * 1024 * 1024
+BLOB_CHUNK_SIZE = int(MAX_ENCRYPTED_SIZE * 0.8)   # 80% safety margin
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("SESSION_TIMEOUT", 120))
 
 executor = ThreadPoolExecutor(max_workers=100)
@@ -187,7 +197,7 @@ def handle_tcp_poll(req: dict) -> dict:
     req["data"] = ""
     return handle_tcp_data(req)
 
-# ---- UDP handlers (FIXED) ----
+# ---- UDP handlers ----
 def handle_udp_associate(req: dict) -> dict:
     session_id = req["session_id"]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -199,13 +209,13 @@ def handle_udp_associate(req: dict) -> dict:
 
 def handle_udp_data(req: dict) -> dict:
     session_id = req["session_id"]
-    session = udp_sessions.get(session_id)      # FIXED – fetch the dict
+    session = udp_sessions.get(session_id)
     if not session:
         return {"error": "session not found"}
     sock = session.get('socket')
     if not sock:
         return {"error": "session not found"}
-    session['last_access'] = time.time()        # FIXED – use 'session' correctly
+    session['last_access'] = time.time()
     data = base64.b64decode(req["data"])
     host = req["host"]
     port = int(req["port"])
@@ -226,13 +236,13 @@ def handle_udp_data(req: dict) -> dict:
 
 def handle_udp_poll(req: dict) -> dict:
     session_id = req["session_id"]
-    session = udp_sessions.get(session_id)      # FIXED
+    session = udp_sessions.get(session_id)
     if not session:
         return {"error": "session not found"}
     sock = session.get('socket')
     if not sock:
         return {"error": "session not found"}
-    session['last_access'] = time.time()        # FIXED
+    session['last_access'] = time.time()
     datagrams = []
     while True:
         ready, _, _ = select.select([sock], [], [], 0)
@@ -350,7 +360,7 @@ def cleanup_stale_sessions():
                 del ws_sessions[sid]
                 log.info("Cleaned up stale WebSocket session %s", sid)
 
-# ---- Cleanup for stale stream buffers and overflow chunks ----
+# ---- Cleanup for stale stream buffers and blob chunk stores ----
 def cleanup_stale_streams():
     while True:
         time.sleep(60)
@@ -360,16 +370,16 @@ def cleanup_stale_streams():
                 del stream_buffers[sid]
                 log.info("Cleaned up stale stream buffer %s", sid)
 
-def cleanup_stale_overflows():
+def cleanup_stale_blob_chunks():
     while True:
         time.sleep(60)
         now = time.time()
-        for bid, buf in list(overflow_chunks.items()):
+        for bid, buf in list(blob_chunks.items()):
             if now - buf.get('timestamp', 0) > 300:
-                del overflow_chunks[bid]
-                log.info("Cleaned up stale overflow batch %s", bid)
+                del blob_chunks[bid]
+                log.info("Cleaned up stale blob batch %s", bid)
 
-# ---- Single request proxy (unchanged) ----
+# ---- Single request proxy ----
 def proxy_single(req: dict) -> dict:
     return proxy_single_with_session(req, None)
 
@@ -393,7 +403,7 @@ def proxy_single_with_session(req: dict, session: requests.Session | None) -> di
         log.error("%s %s error: %s (%.2fs)", method, url[:80], e, dt)
         return {"status": 502, "headers": {}, "body": base64.b64encode(f"Error: {e}".encode()).decode()}
 
-# ---- Large download (unchanged) ----
+# ---- Large download stream buffer ----
 stream_buffers: dict[str, dict] = {}
 
 def fetch_stream_chunk(stream_id: str, chunk_index: int) -> bytes:
@@ -413,7 +423,7 @@ def fetch_stream_chunk(stream_id: str, chunk_index: int) -> bytes:
         raise RuntimeError(f"Chunk fetch failed: {resp.status_code}")
     return base64.b64encode(resp.content).decode()
 
-# ---- Cookie jar (unchanged) ----
+# ---- Cookie jar ----
 def process_batch_with_cookies(reqs: list[dict]) -> list[dict]:
     if not reqs: return []
     groups = defaultdict(list)
@@ -442,43 +452,42 @@ def process_batch_with_cookies(reqs: list[dict]) -> list[dict]:
     for t in threads: t.join()
     return [r for r in results if r is not None]
 
-# ---- Multi‑split batch overflow (with timestamp for cleanup) ----
-overflow_chunks: dict[str, dict] = {}
+# ---- Unified blob chunk store (used when final payload exceeds limit) ----
+blob_chunks: dict[str, dict] = {}
 
-def split_results_recursive(results: list, max_encrypted: int) -> tuple[list, str | None, str]:
+def store_blob_chunks(padded_encrypted: bytes) -> tuple[str, list[str]]:
+    """Split padded encrypted bytes into chunks and return (first_chunk_b64, list_of_tokens)."""
     batch_id = uuid.uuid4().hex
-    def recursive_split(items: list) -> list[list]:
-        plain = json.dumps(items).encode()
-        encrypted = aes_gcm_encrypt(plain)
-        if len(encrypted) <= max_encrypted: return [items]
-        mid = len(items) // 2
-        return recursive_split(items[:mid]) + recursive_split(items[mid:])
-    chunks = recursive_split(results)
-    chunk_tokens = [f"batch_{batch_id}_{idx}" for idx in range(len(chunks))]
-    overflow_chunks[batch_id] = {
+    total_len = len(padded_encrypted)
+    chunks = []
+    for offset in range(0, total_len, BLOB_CHUNK_SIZE):
+        chunk_raw = padded_encrypted[offset:offset+BLOB_CHUNK_SIZE]
+        chunks.append(base64.urlsafe_b64encode(chunk_raw).decode())
+    tokens = [f"blob_{batch_id}_{i}" for i in range(len(chunks))]
+    blob_chunks[batch_id] = {
         "chunks": chunks,
-        "tokens": chunk_tokens,
-        "timestamp": time.time()          # ← for cleanup
+        "tokens": tokens,
+        "timestamp": time.time()
     }
-    if not chunk_tokens: return [], None, batch_id
-    first_chunk = chunks[0]
-    next_token = chunk_tokens[1] if len(chunk_tokens) > 1 else None
-    log.info("Batch overflow split: %d results → %d chunks", len(results), len(chunks))
-    return first_chunk, next_token, batch_id
+    return chunks[0], tokens[1:] if len(tokens) > 1 else []
 
-def get_overflow_chunk(token: str) -> tuple[list | None, str | None]:
+def get_blob_chunk(token: str) -> tuple[str | None, str | None]:
+    """Return (chunk_b64, next_token) or (None, None) if invalid/last."""
     parts = token.split("_", 2)
-    if len(parts) != 3 or parts[0] != "batch": return None, None
-    batch_id = parts[1]
-    idx = int(parts[2])
-    buf = overflow_chunks.get(batch_id)
-    if not buf: return None, None
-    chunks = buf["chunks"]
-    if idx >= len(chunks): return None, None
-    chunk = chunks[idx]
-    next_token = f"batch_{batch_id}_{idx+1}" if idx+1 < len(chunks) else None
-    if idx+1 == len(chunks): del overflow_chunks[batch_id]
-    log.debug("Overflow chunk %d/%d", idx+1, len(chunks))
+    if len(parts) != 3 or parts[0] != "blob":
+        return None, None
+    batch_id, idx = parts[1], int(parts[2])
+    buf = blob_chunks.get(batch_id)
+    if not buf or idx >= len(buf["chunks"]):
+        return None, None
+    chunk = buf["chunks"][idx]
+    next_idx = idx + 1
+    if next_idx < len(buf["chunks"]):
+        next_token = f"blob_{batch_id}_{next_idx}"
+    else:
+        next_token = None
+        del blob_chunks[batch_id]
+        log.info("Blob batch %s fully served, cleaned up", batch_id)
     return chunk, next_token
 
 def get_stream_chunk(token: str) -> dict | None:
@@ -538,10 +547,16 @@ def api():
             log.debug("Processing item type=%s", t)
             if t == "continue":
                 token = item["token"]
-                chunk, next_token = get_overflow_chunk(token)
-                if chunk is None: return Response("Invalid continuation token", status=404)
-                response_obj = {"results": chunk, "more": next_token is not None, "continuation_token": next_token}
-                response_json = json.dumps(response_obj).encode()
+                # Unified blob chunk retrieval
+                chunk_b64, next_token = get_blob_chunk(token)
+                if chunk_b64 is None:
+                    return Response("Invalid continuation token", status=404)
+                resp_obj = {
+                    "chunk": chunk_b64,
+                    "more": next_token is not None,
+                    "token": next_token
+                }
+                response_json = json.dumps(resp_obj).encode()
                 encrypted_resp = aes_gcm_encrypt(response_json)
                 padded = pad_data(encrypted_resp)
                 return Response(padded, mimetype="application/octet-stream")
@@ -582,23 +597,30 @@ def api():
             normal_results = process_batch_with_cookies(normal_items)
             results.extend(normal_results)
 
+        # Build the full response (no item splitting, no list splitting)
         response_obj = {"results": results, "more": False}
         response_json = json.dumps(response_obj).encode()
         encrypted_resp = aes_gcm_encrypt(response_json)
-        if len(encrypted_resp) > MAX_ENCRYPTED_SIZE:
-            log.warning("Encrypted size %d exceeds limit, splitting", len(encrypted_resp))
-            first_chunk, next_token, _ = split_results_recursive(results, MAX_ENCRYPTED_SIZE)
-            response_obj = {
-                "results": first_chunk,
-                "more": next_token is not None,
-                "continuation_token": next_token
-            }
-            response_json = json.dumps(response_obj).encode()
-            encrypted_resp = aes_gcm_encrypt(response_json)
-
         padded = pad_data(encrypted_resp)
-        log.info("Returning %d results, padded size=%d", len(results), len(padded))
-        return Response(padded, mimetype="application/octet-stream")
+
+        # If padded blob fits within the limit, return it directly
+        if len(padded) <= MAX_ENCRYPTED_SIZE:
+            log.info("Returning %d results, padded size=%d", len(results), len(padded))
+            return Response(padded, mimetype="application/octet-stream")
+
+        # Too large – split into base64 chunks and deliver via continuation
+        log.warning("Padded encrypted size %d exceeds limit, chunking", len(padded))
+        first_chunk_b64, remaining_tokens = store_blob_chunks(padded)
+        resp_obj = {
+            "chunk": first_chunk_b64,
+            "more": True if remaining_tokens else False,
+            "token": remaining_tokens[0] if remaining_tokens else None
+        }
+        response_json = json.dumps(resp_obj).encode()
+        encrypted_resp = aes_gcm_encrypt(response_json)
+        padded_resp = pad_data(encrypted_resp)   # note: this is the response that goes to client
+        log.info("Returning first blob chunk, %d more chunks remain", len(remaining_tokens))
+        return Response(padded_resp, mimetype="application/octet-stream")
 
     except Exception as e:
         log.error("API error: %s\n%s", e, traceback.format_exc())
@@ -608,5 +630,5 @@ if __name__ == "__main__":
     threading.Thread(target=cleanup_stale_uploads, daemon=True).start()
     threading.Thread(target=cleanup_stale_sessions, daemon=True).start()
     threading.Thread(target=cleanup_stale_streams, daemon=True).start()
-    threading.Thread(target=cleanup_stale_overflows, daemon=True).start()
+    threading.Thread(target=cleanup_stale_blob_chunks, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
