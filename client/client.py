@@ -5,13 +5,11 @@ Offloads all connection state, TLS, and protocol handling to the VPS.
 Supports HTTP/HTTPS/WebSocket (ws/wss) through the HTTP proxy,
 and all TCP/UDP protocols through SOCKS5.
 
-Environment variables:
-  SCRIPT_ID, AES_KEY_B64            – mandatory
-  FRONT_DOMAINS                     – comma‑separated list of Google frontable domains
-  LISTEN_HOST, LISTEN_PORT, SOCKS_PORT
-  MIN_BATCH_INTERVAL, MAX_BATCH_INTERVAL, MIN_BATCH_SIZE, MAX_HOLD_TIME
-  PADDING_ENABLE                    – "true" to add random padding to payloads
-  PADDING_MIN_EXTRA, PADDING_MAX_EXTRA – bounds for extra random bytes
+Unified blob‑splitting design:
+  - If the final encrypted+padded response exceeds the maximum size,
+    the server splits it into raw chunks delivered via continuation tokens.
+  - The client reassembles the chunks, decrypts, and processes the full
+    batch at once.
 """
 
 import asyncio, base64, datetime, json, logging, os, random, re, secrets, socket, ssl, struct, sys, tempfile, time, traceback, uuid
@@ -49,6 +47,12 @@ MAX_BATCH_INTERVAL = float(os.environ.get("MAX_BATCH_INTERVAL", 0.3))    # 300 m
 MIN_BATCH_SIZE = int(os.environ.get("MIN_BATCH_SIZE", 0))                # 0 = send even when empty
 MAX_HOLD_TIME = float(os.environ.get("MAX_HOLD_TIME", 0.1))              # force send after 0.1 s
 # ---------------------------------------------------------------------------
+
+# Timeout & retry configuration (for slow / hostile networks)
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", 10))       # per‑IP TLS handshake timeout
+RELAY_TIMEOUT = float(os.environ.get("RELAY_TIMEOUT", 600))          # read timeout per relay HTTP request
+MAX_RELAY_RETRIES = int(os.environ.get("MAX_RELAY_RETRIES", 30))     # total retry attempts per batch
+LOCAL_TIMEOUT = float(os.environ.get("LOCAL_TIMEOUT", 60*60))           # timeout for reading from the local browser
 
 UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024
 
@@ -105,7 +109,7 @@ async def _connect_to_google(sni_host: str) -> tuple[asyncio.StreamReader, async
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, 443, ssl=ssl_ctx, server_hostname=sni_host),
-                timeout=20
+                timeout=CONNECT_TIMEOUT          # <-- configurable
             )
             _ip_working_cache[sni_host] = ip
             log.debug("Connected to Google IP %s via SNI %s", ip, sni_host)
@@ -132,6 +136,7 @@ def aes_gcm_decrypt(payload: bytes) -> bytes:
     return decryptor.update(ciphertext) + decryptor.finalize()
 
 def unpad_data(padded: bytes) -> bytes:
+    """Remove the 4‑byte length prefix added by pad_data on the server."""
     if len(padded) < 4:
         raise ValueError("Padding too short")
     data_len = struct.unpack(">I", padded[:4])[0]
@@ -196,7 +201,7 @@ async def domain_fronted_request(host: str, path: str, query: str = "",
         # Read response headers
         header_data = b""
         while b"\r\n\r\n" not in header_data:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=20)
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=RELAY_TIMEOUT)
             if not chunk: break
             header_data += chunk
         if b"\r\n\r\n" not in header_data:
@@ -234,16 +239,16 @@ async def domain_fronted_request(host: str, path: str, query: str = "",
                 content_length = int(headers["content-length"])
                 remaining = content_length - len(body_start)
                 while remaining > 0:
-                    chunk = await asyncio.wait_for(reader.read(min(65536, remaining)), timeout=20)
+                    chunk = await asyncio.wait_for(reader.read(min(65536, remaining)), timeout=RELAY_TIMEOUT)
                     if not chunk: break
                     body_start += chunk
                     remaining -= len(chunk)
                 body = body_start
             except (ValueError, asyncio.TimeoutError):
-                rest = await asyncio.wait_for(reader.read(-1), timeout=30)
+                rest = await asyncio.wait_for(reader.read(-1), timeout=RELAY_TIMEOUT)
                 body = body_start + rest
         else:
-            rest = await asyncio.wait_for(reader.read(-1), timeout=30)
+            rest = await asyncio.wait_for(reader.read(-1), timeout=RELAY_TIMEOUT)
             body = body_start + rest
 
         writer.close()
@@ -480,7 +485,7 @@ class BatchManager:
         return await future
 
     # ------------------------------------------------------------------
-    # Batch firing logic (unchanged)
+    # Batch firing logic
     # ------------------------------------------------------------------
     async def _fire_after_delay(self, interval: float):
         await asyncio.sleep(interval)
@@ -507,6 +512,7 @@ class BatchManager:
         reqs = [req for req, _ in batch]
         is_raw_list = [bool(req.get("type")) for req in reqs]
         route_data_list = [req.get("_route_data", False) for req in reqs]
+
         try:
             raw_data = await self._relay_batch(reqs)
         except Exception as e:
@@ -517,42 +523,62 @@ class BatchManager:
             return
 
         try:
-            pending_futures = [f for (_, f) in batch]
-            pending_is_raw = is_raw_list[:]
-            pending_route_data = route_data_list[:]
-            while True:
-                resp_obj = json.loads(raw_data.decode())
-                results = resp_obj.get("results", [])
+            resp_obj = json.loads(raw_data.decode())
+
+            # ---------------------------------------------------------------
+            # Unified blob‑splitting: server returns "chunk" instead of "results"
+            # if the final encrypted payload was too large and had to be split.
+            # ---------------------------------------------------------------
+            if "chunk" in resp_obj:
+                # Collect all chunks
+                chunks = [resp_obj["chunk"]]
                 more = resp_obj.get("more", False)
-                token = resp_obj.get("continuation_token", None)
-                log.debug("Batch response: %d results, more=%s", len(results), more)
+                token = resp_obj.get("token")
+                while more and token:
+                    log.info("Fetching next chunk via continuation token")
+                    meta_req = {"type": "continue", "token": token}
+                    result = await self.add_raw_request(meta_req, route_data=False)
+                    chunk = result.get("chunk")
+                    if chunk:
+                        chunks.append(chunk)
+                    more = result.get("more", False)
+                    token = result.get("token")
 
-                for idx, result in enumerate(results):
-                    if idx >= len(pending_futures): break
-                    future = pending_futures[idx]
-                    if future.done(): continue
-                    is_raw = pending_is_raw[idx]
-                    route_data = pending_route_data[idx]
-                    self._dispatch_result(result, future, is_raw=is_raw, route_data=route_data)
+                # Concatenate all base64 chunks, then decode
+                full_b64 = "".join(chunks)
+                full_encrypted_padded = base64.urlsafe_b64decode(full_b64)
+                # Unpad (length prefix) then decrypt
+                encrypted = unpad_data(full_encrypted_padded)
+                plain = aes_gcm_decrypt(encrypted)
+                response_obj = json.loads(plain.decode())
+                results = response_obj.get("results", [])
+            else:
+                # Normal batch response, no chunk splitting
+                results = resp_obj.get("results", [])
 
-                pending_futures = pending_futures[len(results):]
-                pending_is_raw = pending_is_raw[len(results):]
-                pending_route_data = pending_route_data[len(results):]
+            # Dispatch results to the corresponding futures
+            pending_futures = [f for (_, f) in batch]
+            if len(results) != len(pending_futures):
+                log.error("Result count mismatch: got %d, expected %d", len(results), len(pending_futures))
+                for future in pending_futures:
+                    if not future.done():
+                        future.set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                return
 
-                if not more or not token:
-                    for future in pending_futures:
-                        if not future.done():
-                            future.set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                    break
-
-                log.info("Continuation token received; queuing meta fetch")
-                meta_req = {"type": "continue", "token": token}
-                raw_data = await self._relay_batch([meta_req])
-                pending_is_raw = [False] * len(pending_futures)
-                pending_route_data = [False] * len(pending_futures)
+            for idx, result in enumerate(results):
+                future = pending_futures[idx]
+                if future.done():
+                    continue
+                self._dispatch_result(result, future,
+                                      is_raw=is_raw_list[idx],
+                                      route_data=route_data_list[idx])
 
         except Exception as e:
             log.error("Batch processing error: %s", e, exc_info=True)
+            # Resolve any still‑pending futures with an error
+            for _, future in batch:
+                if not future.done():
+                    future.set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 
     def _dispatch_result(self, result: dict, future: asyncio.Future,
                          is_raw: bool = False, route_data: bool = False):
@@ -661,14 +687,12 @@ class BatchManager:
 
     async def _queue_stream_continuation(self, meta_req: dict, stream_id: str):
         try:
-            raw_data = await self.add_raw_request(meta_req, route_data=False)
-            resp_obj = json.loads(raw_data.decode())
-            results = resp_obj.get("results", [])
+            result = await self.add_raw_request(meta_req, route_data=False)
+            results = result.get("results", [])
             if results:
-                result = results[0]
                 buf = stream_buffers.get(stream_id)
                 if buf:
-                    self._handle_stream_chunk(result, buf["future"])
+                    self._handle_stream_chunk(results[0], buf["future"])
         except Exception as e:
             log.error("Stream continuation error: %s", e, exc_info=True)
             buf = stream_buffers.get(stream_id)
@@ -679,9 +703,9 @@ class BatchManager:
     def _pick_front_domain(self) -> str:
         return random.choice(FRONT_DOMAINS)
 
-    async def _relay_batch(self, reqs: list[dict], max_retries=30) -> bytes:
+    async def _relay_batch(self, reqs: list[dict]) -> bytes:
         """Relay a batch with automatic retry, front domain rotation, and optional padding."""
-        for attempt in range(max_retries):
+        for attempt in range(MAX_RELAY_RETRIES):
             try:
                 sni_host = self._pick_front_domain()
                 payload_reqs = reqs
@@ -714,8 +738,8 @@ class BatchManager:
                 log.debug("Decrypted batch response: %d bytes", len(plain_response))
                 return plain_response
             except Exception as e:
-                log.warning("Relay attempt %d/%d failed: %s", attempt+1, max_retries, e)
-                if attempt == max_retries - 1:
+                log.warning("Relay attempt %d/%d failed: %s", attempt+1, MAX_RELAY_RETRIES, e)
+                if attempt == MAX_RELAY_RETRIES - 1:
                     raise
                 await asyncio.sleep(0.1)
 
@@ -884,7 +908,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     # Each browser connection gets its own deduplication scope
     conn_id = str(uuid.uuid4())
     try:
-        first_line = await asyncio.wait_for(reader.readline(), timeout=20)
+        first_line = await asyncio.wait_for(reader.readline(), timeout=LOCAL_TIMEOUT)
         if not first_line: return
         parts = first_line.decode().strip().split()
         if len(parts) < 2: return
@@ -904,7 +928,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         header_block = first_line
         while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=20)
+            line = await asyncio.wait_for(reader.readline(), timeout=LOCAL_TIMEOUT)
             if line == b"\r\n" or line == b"\n" or not line: break
             header_block += line
         headers = {}
@@ -919,7 +943,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         clen = int(headers.get("Content-Length", 0))
         body = b""
         if clen > 0:
-            body = await asyncio.wait_for(reader.readexactly(clen), timeout=20)
+            body = await asyncio.wait_for(reader.readexactly(clen), timeout=LOCAL_TIMEOUT)
 
         # WebSocket upgrade detection (for ws:// from browser)
         is_websocket = (
@@ -987,7 +1011,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             "body": base64.b64encode(body).decode() if body else None
         }
 
-        # Use per‑connection dedup for all normal requests
+        # Large uploads are chunked; everything else goes directly through dedup
         if body and len(body) > UPLOAD_CHUNK_SIZE:
             log.info("Large upload chunking (%d bytes)", len(body))
             future = asyncio.get_event_loop().create_future()
@@ -1096,7 +1120,7 @@ async def _relay_http_stream(reader, writer, host: str, conn_id: str):
         try:
             header_data = b""
             while b"\r\n\r\n" not in header_data:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=60*60)
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=LOCAL_TIMEOUT)
                 if not chunk: return
                 header_data += chunk
             request_end = header_data.index(b"\r\n\r\n") + 4
@@ -1122,7 +1146,7 @@ async def _relay_http_stream(reader, writer, host: str, conn_id: str):
 
             clen = int(headers.get("Content-Length", 0))
             while len(body) < clen:
-                chunk = await asyncio.wait_for(reader.read(clen - len(body)), timeout=20)
+                chunk = await asyncio.wait_for(reader.read(clen - len(body)), timeout=LOCAL_TIMEOUT)
                 body += chunk
 
             # WebSocket upgrade detection (inside MITM)
@@ -1199,6 +1223,7 @@ async def _relay_http_stream(reader, writer, host: str, conn_id: str):
                 "body": base64.b64encode(body).decode() if body else None
             }
 
+            # Large uploads are chunked; everything else goes directly through dedup
             if body and len(body) > UPLOAD_CHUNK_SIZE:
                 log.info("MITM large upload: %d bytes", len(body))
                 future = asyncio.get_event_loop().create_future()
@@ -1253,7 +1278,7 @@ async def _forward_raw_websocket(session_id: str, reader: asyncio.StreamReader, 
         unregister_session(session_id)
 
 # ============================================================
-# Large upload / download helpers (with conn_id)
+# Large upload helpers (with conn_id)
 # ============================================================
 UPLOAD_BUFFER: dict[str, dict] = {}
 
@@ -1273,7 +1298,6 @@ async def handle_large_upload(method, url, headers, body, future, conn_id: str):
             "_catflix_chunk": i,
             "_catflix_total": total_chunks
         }
-        # Use per‑connection dedup for each chunk as well
         asyncio.create_task(batch_mgr.add_request(req, conn_id=conn_id))
     return await future
 
