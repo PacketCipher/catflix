@@ -509,7 +509,22 @@ class BatchManager:
     async def _process_batch(self, batch: list[tuple[dict, asyncio.Future]]):
         if not batch:
             return
+
         reqs = [req for req, _ in batch]
+
+        # ── Continuation requests are handled immediately, never queued ──
+        if len(reqs) == 1 and reqs[0].get("type") == "continue":
+            future = batch[0][1]
+            try:
+                raw_data = await self._relay_batch(reqs)
+                resp_obj = json.loads(raw_data.decode())
+                future.set_result(resp_obj)
+            except Exception as e:
+                log.error("Continuation relay failed: %s", e)
+                future.set_exception(e)
+            return
+
+        # ── Normal batch processing below ──
         is_raw_list = [bool(req.get("type")) for req in reqs]
         route_data_list = [req.get("_route_data", False) for req in reqs]
 
@@ -525,38 +540,31 @@ class BatchManager:
         try:
             resp_obj = json.loads(raw_data.decode())
 
-            # ---------------------------------------------------------------
-            # Unified blob‑splitting: server returns "chunk" instead of "results"
-            # if the final encrypted payload was too large and had to be split.
-            # ---------------------------------------------------------------
             if "chunk" in resp_obj:
-                # Collect all chunks
+                # Collect all chunks using the dedicated continuation path
                 chunks = [resp_obj["chunk"]]
                 more = resp_obj.get("more", False)
                 token = resp_obj.get("token")
                 while more and token:
-                    log.info("Fetching next chunk via continuation token")
-                    meta_req = {"type": "continue", "token": token}
-                    result = await self.add_raw_request(meta_req, route_data=False)
+                    log.info("Fetching next chunk via continuation token %s", token[:32])
+                    result = await self._fetch_continuation(token)
                     chunk = result.get("chunk")
                     if chunk:
                         chunks.append(chunk)
                     more = result.get("more", False)
                     token = result.get("token")
 
-                # Concatenate all base64 chunks, then decode
-                full_b64 = "".join(chunks)
-                full_encrypted_padded = base64.urlsafe_b64decode(full_b64)
-                # Unpad (length prefix) then decrypt
+                log.info("Reassembling blob from %d chunks", len(chunks))
+                full_encrypted_padded = b"".join(
+                    base64.urlsafe_b64decode(c) for c in chunks
+                )
                 encrypted = unpad_data(full_encrypted_padded)
                 plain = aes_gcm_decrypt(encrypted)
                 response_obj = json.loads(plain.decode())
                 results = response_obj.get("results", [])
             else:
-                # Normal batch response, no chunk splitting
                 results = resp_obj.get("results", [])
 
-            # Dispatch results to the corresponding futures
             pending_futures = [f for (_, f) in batch]
             if len(results) != len(pending_futures):
                 log.error("Result count mismatch: got %d, expected %d", len(results), len(pending_futures))
@@ -575,10 +583,24 @@ class BatchManager:
 
         except Exception as e:
             log.error("Batch processing error: %s", e, exc_info=True)
-            # Resolve any still‑pending futures with an error
             for _, future in batch:
                 if not future.done():
                     future.set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+
+    # ── Dedicated continuation helper (bypasses queue, respects intervals) ──
+    async def _fetch_continuation(self, token: str) -> dict:
+        """
+        Fetch a single chunk continuation response.
+        This bypasses the normal batching queue to avoid cross‑talk,
+        but still obeys the interval constraints before sending.
+        """
+        # Wait a short random interval to respect the configured jitter
+        interval = random.uniform(MIN_BATCH_INTERVAL, MAX_BATCH_INTERVAL)
+        await asyncio.sleep(interval)
+
+        req = {"type": "continue", "token": token}
+        raw_data = await self._relay_batch([req])
+        return json.loads(raw_data.decode())
 
     def _dispatch_result(self, result: dict, future: asyncio.Future,
                          is_raw: bool = False, route_data: bool = False):
