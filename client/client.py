@@ -5,14 +5,22 @@ Offloads all connection state, TLS, and protocol handling to the VPS.
 Supports HTTP/HTTPS/WebSocket (ws/wss) through the HTTP proxy,
 and all TCP/UDP protocols through SOCKS5.
 
-Unified blob‑splitting design:
-  - If the final encrypted+padded response exceeds the maximum size,
-    the server splits it into raw chunks delivered via continuation tokens.
-  - The client reassembles the chunks, decrypts, and processes the full
-    batch at once.
+Environment variables:
+  SCRIPT_IDS                       – comma‑separated list of Apps Script deployment IDs (mandatory)
+  AES_KEY_B64                      – base64‑encoded AES key (mandatory)
+  FRONT_DOMAINS                    – comma‑separated list of Google frontable domains
+  LISTEN_HOST, LISTEN_PORT, SOCKS_PORT
+  MIN_BATCH_INTERVAL, MAX_BATCH_INTERVAL, MIN_BATCH_SIZE, MAX_HOLD_TIME
+  PADDING_ENABLE                   – "true" to add random padding to payloads
+  PADDING_MIN_EXTRA, PADDING_MAX_EXTRA – bounds for extra random bytes
+  CONNECT_TIMEOUT                  – max seconds to establish TCP+TLS to one IP (default 10)
+  RELAY_TIMEOUT                    – read timeout per relay HTTP request (default 600)
+  MAX_RELAY_RETRIES                – max retries per relay batch (default 30)
+  LOCAL_TIMEOUT                    – timeout for reading from the local browser (default 3600)
 """
 
 import asyncio, base64, datetime, json, logging, os, random, re, secrets, socket, ssl, struct, sys, tempfile, time, traceback, uuid
+from collections import defaultdict
 from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,7 +32,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 # ============================================================
 # Configuration (environment variables override)
 # ============================================================
-DEPLOY_ID = os.environ.get("SCRIPT_ID", "YOUR_DEPLOY_ID")
+SCRIPT_IDS_STR = os.environ.get("SCRIPT_IDS", "YOUR_DEPLOY_ID")
+SCRIPT_IDS = [s.strip() for s in SCRIPT_IDS_STR.split(",") if s.strip()]
+
 AES_KEY_B64 = os.environ.get("AES_KEY_B64", "YOUR_BASE64_KEY")
 AES_KEY = base64.b64decode(AES_KEY_B64)
 
@@ -35,7 +45,6 @@ _GOOGLE_IPS_STR = os.environ.get("GOOGLE_IPS", "216.239.38.120,216.239.38.121,21
 GOOGLE_IPS = [ip.strip() for ip in _GOOGLE_IPS_STR.split(",") if ip.strip()]
 
 SCRIPT_HOST = "script.google.com"
-BASE_PATH = f"/macros/s/{DEPLOY_ID}/exec"
 
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", 8080))
@@ -90,30 +99,61 @@ def unpad_payload(padded: bytes) -> bytes:
     return padded[4:4 + data_len]
 
 # ============================================================
-# Google IP rotation (now per front domain)
+# Success‑based resource ranking (replaces circuit breaker)
 # ============================================================
-_ip_working_cache = {}   # front_domain -> last_working_ip
+class ResourceRanker:
+    """Tracks success counts and returns resources sorted from best to worst."""
+    def __init__(self):
+        self._successes = defaultdict(int)
 
-async def _connect_to_google(sni_host: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    def record_success(self, resource: str):
+        """Mark a resource as successful."""
+        self._successes[resource] += 1
+
+    def sorted_resources(self, resources: list) -> list:
+        """Return a copy of the list sorted by success count descending."""
+        # Shuffle first so that ties are broken randomly
+        shuffled = list(resources)
+        random.shuffle(shuffled)
+        return sorted(shuffled, key=lambda r: self._successes.get(r, 0), reverse=True)
+
+# Global ranker instance used by all resource selectors
+resource_ranker = ResourceRanker()
+
+# ============================================================
+# Google IP rotation (now per front domain) with success ordering
+# ============================================================
+_ip_working_cache = {}   # front_domain -> last_working_ip (kept for quick fallback)
+
+async def _connect_to_google(sni_host: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
+    """
+    Connect to a Google IP with the given SNI.
+    Tries IPs in order of past success, falling back to any.
+    Returns (reader, writer, used_ip).
+    """
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     global _ip_working_cache
     errors = []
-    ips = list(GOOGLE_IPS)
-    random.shuffle(ips)
-    last_ip = _ip_working_cache.get(sni_host, GOOGLE_IPS[0])
-    if last_ip in ips:
-        ips.remove(last_ip)
-        ips.insert(0, last_ip)
-    for ip in ips:
+
+    # Get IPs sorted by success count
+    sorted_ips = resource_ranker.sorted_resources(GOOGLE_IPS)
+
+    # Ensure the last known working IP for this SNI is tried first (if present)
+    last_ip = _ip_working_cache.get(sni_host)
+    if last_ip and last_ip in sorted_ips:
+        sorted_ips.remove(last_ip)
+        sorted_ips.insert(0, last_ip)
+
+    for ip in sorted_ips:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, 443, ssl=ssl_ctx, server_hostname=sni_host),
-                timeout=CONNECT_TIMEOUT          # <-- configurable
+                timeout=CONNECT_TIMEOUT
             )
             _ip_working_cache[sni_host] = ip
             log.debug("Connected to Google IP %s via SNI %s", ip, sni_host)
-            return reader, writer
+            return reader, writer, ip
         except Exception as e:
             errors.append(f"{ip}: {e}")
             log.debug("IP %s failed for %s: %s", ip, sni_host, e)
@@ -143,6 +183,7 @@ def unpad_data(padded: bytes) -> bytes:
     return padded[4:4+data_len]
 
 def dechunk_body(raw: bytes) -> bytes:
+    """Decode an HTTP chunked body."""
     body = b""
     while raw:
         pos = raw.find(b"\r\n")
@@ -164,17 +205,20 @@ def dechunk_body(raw: bytes) -> bytes:
 async def domain_fronted_request(host: str, path: str, query: str = "",
                                  method: str = "GET", body: bytes = None,
                                  sni_host: str = None) -> bytes:
-    """Makes an HTTP request with optional SNI rotation."""
+    """Makes an HTTP request with optional SNI rotation. Returns the response body."""
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     max_redirects = 5
     cur_host, cur_path, cur_query = host, path, query
     cur_method, cur_body = method, body
-    cur_sni = sni_host or FRONT_DOMAINS[0]
+    if not sni_host:
+        # If no SNI given, pick the top ranked front domain
+        ranked = resource_ranker.sorted_resources(FRONT_DOMAINS)
+        sni_host = ranked[0] if ranked else random.choice(FRONT_DOMAINS)
 
     for attempt in range(max_redirects):
-        log.debug("Request attempt %d: SNI=%s host=%s method=%s", attempt+1, cur_sni, cur_host, cur_method)
-        reader, writer = await _connect_to_google(cur_sni)
+        log.debug("Request attempt %d: SNI=%s host=%s method=%s", attempt+1, sni_host, cur_host, cur_method)
+        reader, writer, used_ip = await _connect_to_google(sni_host)
 
         if cur_method == "POST" and cur_body:
             request_line = (
@@ -231,6 +275,8 @@ async def domain_fronted_request(host: str, path: str, query: str = "",
             if status_code in (302, 303):
                 cur_method = "GET"
                 cur_body = None
+            # For redirect, pick a new front domain (top ranked)
+            sni_host = resource_ranker.sorted_resources(FRONT_DOMAINS)[0]
             continue
 
         # Read body
@@ -256,12 +302,13 @@ async def domain_fronted_request(host: str, path: str, query: str = "",
         if transfer_encoding == "chunked" and "content-length" not in headers:
             body = dechunk_body(body)
         log.debug("Body received: %d bytes", len(body))
-        return body
+        # Return the body; the caller will record success for the used_ip etc.
+        return body, used_ip, sni_host
 
     raise RuntimeError("Too many redirects")
 
 # ============================================================
-# MITM CA Manager
+# MITM CA Manager (unchanged)
 # ============================================================
 CA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ca")
 CA_KEY_FILE = os.path.join(CA_DIR, "ca.key")
@@ -524,7 +571,7 @@ class BatchManager:
                 future.set_exception(e)
             return
 
-        # ── Normal batch processing below ──
+        # ── Normal batch processing ──
         is_raw_list = [bool(req.get("type")) for req in reqs]
         route_data_list = [req.get("_route_data", False) for req in reqs]
 
@@ -540,6 +587,10 @@ class BatchManager:
         try:
             resp_obj = json.loads(raw_data.decode())
 
+            # ---------------------------------------------------------------
+            # Unified blob‑splitting: server returns "chunk" instead of "results"
+            # if the final encrypted payload was too large and had to be split.
+            # ---------------------------------------------------------------
             if "chunk" in resp_obj:
                 # Collect all chunks using the dedicated continuation path
                 chunks = [resp_obj["chunk"]]
@@ -555,16 +606,20 @@ class BatchManager:
                     token = result.get("token")
 
                 log.info("Reassembling blob from %d chunks", len(chunks))
+                # Decode each chunk separately, then concatenate raw bytes
                 full_encrypted_padded = b"".join(
                     base64.urlsafe_b64decode(c) for c in chunks
                 )
+                # Unpad (length prefix) then decrypt
                 encrypted = unpad_data(full_encrypted_padded)
                 plain = aes_gcm_decrypt(encrypted)
                 response_obj = json.loads(plain.decode())
                 results = response_obj.get("results", [])
             else:
+                # Normal batch response, no chunk splitting
                 results = resp_obj.get("results", [])
 
+            # Dispatch results to the corresponding futures
             pending_futures = [f for (_, f) in batch]
             if len(results) != len(pending_futures):
                 log.error("Result count mismatch: got %d, expected %d", len(results), len(pending_futures))
@@ -583,6 +638,7 @@ class BatchManager:
 
         except Exception as e:
             log.error("Batch processing error: %s", e, exc_info=True)
+            # Resolve any still‑pending futures with an error
             for _, future in batch:
                 if not future.done():
                     future.set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -594,7 +650,6 @@ class BatchManager:
         This bypasses the normal batching queue to avoid cross‑talk,
         but still obeys the interval constraints before sending.
         """
-        # Wait a short random interval to respect the configured jitter
         interval = random.uniform(MIN_BATCH_INTERVAL, MAX_BATCH_INTERVAL)
         await asyncio.sleep(interval)
 
@@ -722,48 +777,68 @@ class BatchManager:
                 buf["future"].set_result(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 del stream_buffers[stream_id]
 
-    def _pick_front_domain(self) -> str:
-        return random.choice(FRONT_DOMAINS)
-
+    # ── Relay with retry and success‑based resource ordering ──
     async def _relay_batch(self, reqs: list[dict]) -> bytes:
-        """Relay a batch with automatic retry, front domain rotation, and optional padding."""
-        for attempt in range(MAX_RELAY_RETRIES):
-            try:
-                sni_host = self._pick_front_domain()
-                payload_reqs = reqs
-                plain_payload = json.dumps(payload_reqs).encode()
-                # Optional padding
-                if PADDING_ENABLE:
-                    plain_payload = pad_payload(plain_payload)
-                encrypted_payload = aes_gcm_encrypt(plain_payload)
-                b64_payload = base64.urlsafe_b64encode(encrypted_payload).decode()
-                log.debug("Relay batch: plain=%d, encrypted=%d, b64=%d",
-                          len(plain_payload), len(encrypted_payload), len(b64_payload))
+        """
+        Relay a batch, trying script IDs and front domains in order of past success.
+        """
+        scripts_ranked = resource_ranker.sorted_resources(SCRIPT_IDS)
+        domains_ranked = resource_ranker.sorted_resources(FRONT_DOMAINS)
 
-                post_body = f"q={b64_payload}".encode()
-                relay_body = await domain_fronted_request(
-                    SCRIPT_HOST, BASE_PATH, method="POST", body=post_body, sni_host=sni_host
-                )
+        total_attempts = 0
+        last_exception = None
 
-                relay_text = relay_body.decode("ascii", errors="replace").strip()
-                if not relay_text:
-                    raise ValueError("Relay returned empty response")
-                padding_needed = 4 - (len(relay_text) % 4)
-                if padding_needed != 4:
-                    relay_text += "=" * padding_needed
-                padded_encrypted = base64.urlsafe_b64decode(relay_text)
-                encrypted_response = unpad_data(padded_encrypted)
-                plain_response = aes_gcm_decrypt(encrypted_response)
-                # Unpad response if padding is enabled (server must match)
-                if PADDING_ENABLE:
-                    plain_response = unpad_payload(plain_response)
-                log.debug("Decrypted batch response: %d bytes", len(plain_response))
-                return plain_response
-            except Exception as e:
-                log.warning("Relay attempt %d/%d failed: %s", attempt+1, MAX_RELAY_RETRIES, e)
-                if attempt == MAX_RELAY_RETRIES - 1:
-                    raise
-                await asyncio.sleep(0.1)
+        for script_id in scripts_ranked:
+            base_path = f"/macros/s/{script_id}/exec"
+            for sni_host in domains_ranked:
+                if total_attempts >= MAX_RELAY_RETRIES:
+                    raise RuntimeError(f"Max relay retries ({MAX_RELAY_RETRIES}) exceeded")
+                total_attempts += 1
+
+                try:
+                    log.debug("Relay attempt %d: SNI=%s, script=%s", total_attempts, sni_host, script_id)
+
+                    plain_payload = json.dumps(reqs).encode()
+                    if PADDING_ENABLE:
+                        plain_payload = pad_payload(plain_payload)
+                    encrypted_payload = aes_gcm_encrypt(plain_payload)
+                    b64_payload = base64.urlsafe_b64encode(encrypted_payload).decode()
+                    log.debug("Relay batch: plain=%d, encrypted=%d, b64=%d",
+                              len(plain_payload), len(encrypted_payload), len(b64_payload))
+
+                    post_body = f"q={b64_payload}".encode()
+                    relay_body, used_ip, _ = await domain_fronted_request(
+                        SCRIPT_HOST, base_path, method="POST", body=post_body, sni_host=sni_host
+                    )
+
+                    relay_text = relay_body.decode("ascii", errors="replace").strip()
+                    if not relay_text:
+                        raise ValueError("Relay returned empty response")
+                    padding_needed = 4 - (len(relay_text) % 4)
+                    if padding_needed != 4:
+                        relay_text += "=" * padding_needed
+                    padded_encrypted = base64.urlsafe_b64decode(relay_text)
+                    encrypted_response = unpad_data(padded_encrypted)
+                    plain_response = aes_gcm_decrypt(encrypted_response)
+                    if PADDING_ENABLE:
+                        plain_response = unpad_payload(plain_response)
+                    log.debug("Decrypted batch response: %d bytes", len(plain_response))
+
+                    # Record successes for all resources used in this successful relay
+                    resource_ranker.record_success(script_id)
+                    resource_ranker.record_success(sni_host)
+                    resource_ranker.record_success(used_ip)
+
+                    return plain_response
+
+                except Exception as e:
+                    log.warning("Relay attempt %d failed: %s", total_attempts, e)
+                    last_exception = e
+                    # Continue to next combination
+                    await asyncio.sleep(0.1)
+
+        # If we exit the loops without success
+        raise RuntimeError(f"All relay attempts failed") from last_exception
 
     def _build_http_response(self, resp: dict) -> bytes:
         status = resp["status"]
