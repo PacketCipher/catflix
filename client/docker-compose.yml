@@ -6,12 +6,12 @@ services:
     container_name: catflix-client
     restart: unless-stopped
     ports:
-      - "0.0.0.0:1080:1080"        # socks5
-      - "0.0.0.0:8080:8080"        # http, https
+      - "127.0.0.1:1080:1080"        # socks5
+      - "127.0.0.1:8080:8080"        # http, https
     volumes:
       - ./ca:/app/ca                  # persist CA certificate
     environment:
-      - SCRIPT_ID=${SCRIPT_ID}        # from .env file
+      - SCRIPT_IDS=${SCRIPT_IDS}        # from .env file
       - AES_KEY_B64=${AES_KEY_B64}
       - MIN_BATCH_INTERVAL=${MIN_BATCH_INTERVAL}   # safe default
       - MAX_BATCH_INTERVAL=${MAX_BATCH_INTERVAL}
